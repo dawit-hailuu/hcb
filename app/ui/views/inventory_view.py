@@ -1,11 +1,13 @@
 """Inventory view: raw materials list + add stock dialog + history view."""
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTableWidget, QTableWidgetItem,
                              QHeaderView, QDialog, QFormLayout, QComboBox,
-                             QDoubleSpinBox, QLineEdit, QMessageBox, QTabWidget)
+                             QDoubleSpinBox, QLineEdit, QMessageBox, QTabWidget,
+                             QDateEdit, QCheckBox)
 
 from app.services import inventory_service
+from app.utils import vat
 
 
 class _AddStockDialog(QDialog):
@@ -20,13 +22,34 @@ class _AddStockDialog(QDialog):
             self.mat_combo.addItem(f"{m['name']} ({m['unit']})", m["id"])
         form.addRow("Material:", self.mat_combo)
 
+        self.date = QDateEdit(QDate.currentDate())
+        self.date.setCalendarPopup(True)
+        self.date.setDisplayFormat("yyyy-MM-dd")
+        self.date.setMaximumDate(QDate.currentDate())
+        form.addRow("Purchase date:", self.date)
+
         self.qty = QDoubleSpinBox()
         self.qty.setRange(0, 1_000_000); self.qty.setDecimals(3); self.qty.setValue(0)
+        self.qty.valueChanged.connect(self._recalc)
         form.addRow("Quantity:", self.qty)
 
         self.cost = QDoubleSpinBox()
         self.cost.setRange(0, 1_000_000); self.cost.setDecimals(2); self.cost.setValue(0)
-        form.addRow("Unit Cost (ETB, optional):", self.cost)
+        self.cost.valueChanged.connect(self._recalc)
+        form.addRow("Unit cost before VAT (ETB):", self.cost)
+
+        self.apply_vat = QCheckBox(f"Add {vat.VAT_RATE:.0%} VAT")
+        self.apply_vat.setChecked(True)
+        self.apply_vat.toggled.connect(self._recalc)
+        form.addRow("VAT:", self.apply_vat)
+
+        self.subtotal_lbl = QLabel("0.00 ETB")
+        form.addRow("Subtotal:", self.subtotal_lbl)
+        self.vat_lbl = QLabel("0.00 ETB")
+        form.addRow(f"VAT ({vat.VAT_RATE:.0%}):", self.vat_lbl)
+        self.total_lbl = QLabel("0.00 ETB")
+        self.total_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #C0392B;")
+        form.addRow("Total paid:", self.total_lbl)
 
         self.note = QLineEdit()
         self.note.setPlaceholderText("Supplier / invoice / note")
@@ -37,6 +60,13 @@ class _AddStockDialog(QDialog):
         cancel = QPushButton("Cancel"); cancel.setObjectName("secondary"); cancel.clicked.connect(self.reject)
         btn_row.addWidget(ok); btn_row.addWidget(cancel)
         form.addRow(btn_row)
+
+    def _recalc(self):
+        sub, v, tot = vat.split(self.qty.value() * self.cost.value(),
+                                self.apply_vat.isChecked())
+        self.subtotal_lbl.setText(f"{sub:,.2f} ETB")
+        self.vat_lbl.setText(f"{v:,.2f} ETB")
+        self.total_lbl.setText(f"{tot:,.2f} ETB")
 
 
 class _AdjustDialog(QDialog):
@@ -133,9 +163,10 @@ class InventoryView(QWidget):
         from app.ui.widgets.search_box import SearchBox
         self.search = SearchBox(None, placeholder="Search stock movements by material, type, user, note, date…")
         v2.addWidget(self.search)
-        self.hist = QTableWidget(0, 7)
+        self.hist = QTableWidget(0, 10)
         self.hist.setHorizontalHeaderLabels(
-            ["When", "Material", "Qty", "Unit", "Type", "User", "Note"])
+            ["When", "Material", "Qty", "Unit", "Type", "Unit Cost",
+             "VAT", "Total Paid", "User", "Note"])
         self.hist.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.hist.verticalHeader().setVisible(False)
         self.hist.setAlternatingRowColors(True)
@@ -178,8 +209,13 @@ class InventoryView(QWidget):
             self.hist.setItem(r, 2, item)
             self.hist.setItem(r, 3, QTableWidgetItem(h["unit"]))
             self.hist.setItem(r, 4, QTableWidgetItem(h["movement"]))
-            self.hist.setItem(r, 5, QTableWidgetItem(h.get("user_name") or ""))
-            self.hist.setItem(r, 6, QTableWidgetItem(h.get("note") or ""))
+            money = lambda v: f"{v:,.2f}" if v is not None else ""
+            self.hist.setItem(r, 5, QTableWidgetItem(money(h.get("unit_cost"))))
+            self.hist.setItem(r, 6, QTableWidgetItem(
+                money(h.get("vat_amount")) if h.get("total_cost") is not None else ""))
+            self.hist.setItem(r, 7, QTableWidgetItem(money(h.get("total_cost"))))
+            self.hist.setItem(r, 8, QTableWidgetItem(h.get("user_name") or ""))
+            self.hist.setItem(r, 9, QTableWidgetItem(h.get("note") or ""))
         if hasattr(self, "search"):
             self.search.reapply()
 
@@ -190,14 +226,21 @@ class InventoryView(QWidget):
         if dlg.qty.value() <= 0:
             QMessageBox.warning(self, "Invalid", "Quantity must be greater than zero."); return
         try:
-            inventory_service.add_stock(
+            res = inventory_service.add_stock(
                 material_id=dlg.mat_combo.currentData(),
                 qty=dlg.qty.value(),
                 user_id=self.user["id"],
                 note=dlg.note.text() or None,
                 unit_cost=dlg.cost.value() if dlg.cost.value() > 0 else None,
+                purchase_date=dlg.date.date().toString("yyyy-MM-dd"),
+                apply_vat=dlg.apply_vat.isChecked(),
             )
-            QMessageBox.information(self, "Done", "Stock added successfully.")
+            msg = "Stock added successfully."
+            if res.get("total_cost") is not None:
+                msg += (f"\n\nSubtotal: {res['subtotal']:,.2f} ETB"
+                        f"\nVAT ({vat.VAT_RATE:.0%}): {res['vat_amount']:,.2f} ETB"
+                        f"\nTotal paid: {res['total_cost']:,.2f} ETB")
+            QMessageBox.information(self, "Done", msg)
             self.refresh()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))

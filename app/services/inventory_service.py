@@ -6,8 +6,10 @@ All stock changes go through `record_movement()` which:
   2) updates the cached current_stock on materials
 in a single transaction.
 """
+from datetime import datetime
+
 from app.database.db import get_connection
-from app.utils import clock
+from app.utils import clock, vat
 
 
 def list_materials():
@@ -32,7 +34,9 @@ def get_material(material_id: int):
 
 def record_movement(material_id: int, qty: float, movement: str,
                     user_id: int = None, reference: str = None, note: str = None,
-                    conn=None):
+                    conn=None, created_at: str = None, unit_cost: float = None,
+                    subtotal: float = None, vat_amount: float = 0.0,
+                    total_cost: float = None):
     """
     Record a stock change.  qty is SIGNED:
       - positive for purchase / addition
@@ -50,9 +54,12 @@ def record_movement(material_id: int, qty: float, movement: str,
     try:
         conn.execute(
             """INSERT INTO stock_movements
-                 (material_id, qty, movement, reference, note, user_id, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (material_id, qty, movement, reference, note, user_id, clock.now()),
+                 (material_id, qty, movement, reference, note, user_id, created_at,
+                  unit_cost, subtotal, vat_amount, total_cost)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (material_id, qty, movement, reference, note, user_id,
+             created_at or clock.now(), unit_cost, subtotal, vat_amount or 0.0,
+             total_cost),
         )
         conn.execute(
             "UPDATE materials SET current_stock = current_stock + ? WHERE id = ?",
@@ -66,20 +73,52 @@ def record_movement(material_id: int, qty: float, movement: str,
 
 
 def add_stock(material_id: int, qty: float, user_id: int = None,
-              note: str = None, unit_cost: float = None):
-    """User-facing 'add stock' (purchase or initial stocking)."""
+              note: str = None, unit_cost: float = None,
+              purchase_date: str = None, apply_vat: bool = True):
+    """User-facing 'add stock' (purchase or initial stocking).
+
+    purchase_date: 'YYYY-MM-DD' entered by the user (defaults to today). It is
+                   stored as the movement's timestamp so reports put the purchase
+                   on the right day. Future dates are rejected.
+    unit_cost:     price per unit BEFORE VAT. When given, the 15% input VAT
+                   (if apply_vat) and the total paid are stored with the movement.
+    Returns a dict with subtotal / vat_amount / total_cost (None if no cost given).
+    """
     if qty <= 0:
         raise ValueError("Quantity to add must be positive")
+
+    if purchase_date:
+        try:
+            d = datetime.strptime(purchase_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError("Purchase date must be in YYYY-MM-DD format")
+        if d > datetime.now().date():
+            raise ValueError("Purchase date cannot be in the future")
+        created_at = f"{purchase_date} {datetime.now():%H:%M:%S}"
+    else:
+        created_at = clock.now()
+
+    subtotal = vat_amount = total_cost = None
+    if unit_cost is not None:
+        subtotal, vat_amount, total_cost = vat.split(qty * unit_cost, apply_vat)
+
     conn = get_connection()
     try:
         record_movement(material_id, qty, "purchase",
-                        user_id=user_id, note=note, conn=conn)
+                        user_id=user_id, note=note, conn=conn,
+                        created_at=created_at, unit_cost=unit_cost,
+                        subtotal=subtotal, vat_amount=vat_amount or 0.0,
+                        total_cost=total_cost)
         if unit_cost is not None:
             conn.execute("UPDATE materials SET unit_cost = ? WHERE id = ?",
                          (unit_cost, material_id))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+    return {"subtotal": subtotal, "vat_amount": vat_amount, "total_cost": total_cost}
 
 
 def adjust_stock(material_id: int, new_qty: float, user_id: int = None, note: str = None):
@@ -104,7 +143,7 @@ def stock_history(material_id: int = None, limit: int = 500):
                    FROM stock_movements sm
                    JOIN materials m ON m.id = sm.material_id
                    LEFT JOIN users u ON u.id = sm.user_id
-                   ORDER BY sm.id DESC LIMIT ?""", (limit,)
+                   ORDER BY sm.created_at DESC, sm.id DESC LIMIT ?""", (limit,)
             ).fetchall()
         else:
             rows = conn.execute(
@@ -114,7 +153,7 @@ def stock_history(material_id: int = None, limit: int = 500):
                    JOIN materials m ON m.id = sm.material_id
                    LEFT JOIN users u ON u.id = sm.user_id
                    WHERE sm.material_id = ?
-                   ORDER BY sm.id DESC LIMIT ?""", (material_id, limit)
+                   ORDER BY sm.created_at DESC, sm.id DESC LIMIT ?""", (material_id, limit)
             ).fetchall()
         return [dict(r) for r in rows]
     finally:

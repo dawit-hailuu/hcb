@@ -8,12 +8,46 @@ All tables created here. The schema is designed so that:
 """
 import sqlite3
 import os
+import sys
 from pathlib import Path
 
-# Database file lives in ./data/factory.db next to the executable.
-DB_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-DB_DIR.mkdir(exist_ok=True)
+
+def _is_writable(folder: Path) -> bool:
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".write_test"
+        probe.write_text("ok")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_app_dir() -> Path:
+    """Folder that holds persistent data (data/factory.db, exports/).
+
+    IMPORTANT: when running as a PyInstaller-built main.exe, ``__file__`` points
+    into a temporary _MEIxxxx folder that is DELETED when the app closes — so a
+    database stored there loses every user, password and record on exit.
+    For the frozen exe we therefore store data next to main.exe, falling back to
+    %LOCALAPPDATA%\\MNConstruction if that folder is not writable
+    (e.g. the exe was copied into C:\\Program Files).
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        if _is_writable(exe_dir / "data"):
+            return exe_dir
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "MNConstruction"
+    # Running from source: project root (…/hcb_factory)
+    return Path(__file__).resolve().parent.parent.parent
+
+
+APP_DIR = _resolve_app_dir()
+DB_DIR = APP_DIR / "data"
+DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "factory.db"
+EXPORTS_DIR = APP_DIR / "exports"
 
 
 def get_connection():
@@ -63,6 +97,10 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     reference   TEXT,                            -- e.g. production_id or supplier name
     note        TEXT,
     user_id     INTEGER REFERENCES users(id),
+    unit_cost   REAL,                            -- purchase price per unit, before VAT
+    subtotal    REAL,                            -- qty * unit_cost (before VAT)
+    vat_amount  REAL NOT NULL DEFAULT 0,         -- input VAT paid on the purchase
+    total_cost  REAL,                            -- subtotal + vat_amount
     created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 
@@ -128,9 +166,13 @@ CREATE TABLE IF NOT EXISTS sales (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id    INTEGER NOT NULL REFERENCES products(id),
     customer_name TEXT,
+    tin_number    TEXT,                            -- buyer's Tax Identification Number (optional)
+    vehicle_plate TEXT,                            -- vehicle license plate carrying the goods (optional)
     quantity      REAL NOT NULL,
-    unit_price    REAL NOT NULL,
-    total         REAL NOT NULL,
+    unit_price    REAL NOT NULL,                   -- before VAT
+    total         REAL NOT NULL,                   -- quantity * unit_price (before VAT)
+    vat_amount    REAL NOT NULL DEFAULT 0,         -- output VAT charged to the buyer
+    total_with_vat REAL,                           -- total + vat_amount (what buyer pays)
     sale_date     TEXT NOT NULL DEFAULT (date('now','localtime')),
     user_id       INTEGER REFERENCES users(id),
     note          TEXT,
@@ -204,6 +246,49 @@ def _run_migrations(conn):
             conn.commit()
         except Exception:
             pass  # column may have been added in a parallel run
+
+    # ----------------------------------------------------------------
+    # Migration: add tin_number / vehicle_plate columns to sales
+    # (buyer's TIN for tax invoices; delivery vehicle plate — both optional)
+    # ----------------------------------------------------------------
+    if not _column_exists(conn, "sales", "tin_number"):
+        try:
+            conn.execute("ALTER TABLE sales ADD COLUMN tin_number TEXT")
+            conn.commit()
+        except Exception:
+            pass
+    if not _column_exists(conn, "sales", "vehicle_plate"):
+        try:
+            conn.execute("ALTER TABLE sales ADD COLUMN vehicle_plate TEXT")
+            conn.commit()
+        except Exception:
+            pass
+
+    # ----------------------------------------------------------------
+    # Migration: VAT (15%) on purchases and sales
+    #   stock_movements: unit_cost, subtotal, vat_amount, total_cost
+    #       (purchase cost before VAT, input VAT paid, total paid)
+    #   sales: vat_amount, total_with_vat
+    #       (sales.total stays the NET amount before VAT, so revenue
+    #        figures are unchanged; total_with_vat is what the buyer pays)
+    # ----------------------------------------------------------------
+    for table, column, decl in (
+        ("stock_movements", "unit_cost",      "REAL"),
+        ("stock_movements", "subtotal",       "REAL"),
+        ("stock_movements", "vat_amount",     "REAL NOT NULL DEFAULT 0"),
+        ("stock_movements", "total_cost",     "REAL"),
+        ("sales",           "vat_amount",     "REAL NOT NULL DEFAULT 0"),
+        ("sales",           "total_with_vat", "REAL"),
+    ):
+        if not _column_exists(conn, table, column):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                conn.commit()
+            except Exception:
+                pass
+    # Old sales were recorded without VAT: what was paid = total.
+    conn.execute("UPDATE sales SET total_with_vat = total WHERE total_with_vat IS NULL")
+    conn.commit()
 
     # ----------------------------------------------------------------
     # Migration: allow PIPE category on products

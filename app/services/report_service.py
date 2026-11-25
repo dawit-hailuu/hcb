@@ -162,18 +162,26 @@ def material_usage_report(date_from: str, date_to: str):
             ).fetchone()
             purchased = purchased_row["s"]
 
-            # Net change in period from ANY movement type (incl. adjustments)
-            net_row = conn.execute(
+            # Working backwards from the CURRENT (live) stock:
+            #   opening (at period start) = current - every movement on/after period start
+            #   remaining (at period end) = current - every movement strictly after period end
+            # This stays correct even for historical periods, where movements made
+            # after the reporting window must not leak into the opening/closing figures.
+            since_open_row = conn.execute(
                 """SELECT COALESCE(SUM(qty), 0) AS s
                    FROM stock_movements
-                   WHERE material_id = ?
-                     AND created_at BETWEEN ? AND ?""",
-                (m["id"], rng_lo, rng_hi),
+                   WHERE material_id = ? AND created_at >= ?""",
+                (m["id"], rng_lo),
             ).fetchone()
-            net_change = net_row["s"]
+            opening_stock = m["current_stock"] - since_open_row["s"]
 
-            # Working backwards: opening = current - net_change_during_period
-            opening_stock = m["current_stock"] - net_change
+            after_close_row = conn.execute(
+                """SELECT COALESCE(SUM(qty), 0) AS s
+                   FROM stock_movements
+                   WHERE material_id = ? AND created_at > ?""",
+                (m["id"], rng_hi),
+            ).fetchone()
+            remaining = m["current_stock"] - after_close_row["s"]
 
             out.append({
                 "code":          m["code"],
@@ -182,7 +190,7 @@ def material_usage_report(date_from: str, date_to: str):
                 "opening_stock": opening_stock,
                 "total_used":    total_used,
                 "purchased":     purchased,
-                "remaining":     m["current_stock"],
+                "remaining":     remaining,
             })
         return out
     finally:
@@ -207,7 +215,11 @@ def sales_report(date_from: str, date_to: str, category: str = None,
         sql = f"""
             SELECT s.id, s.sale_date, pr.code, pr.name, pr.input_unit, pr.category,
                    COALESCE(s.customer_name, '') AS customer_name,
+                   COALESCE(s.tin_number, '') AS tin_number,
+                   COALESCE(s.vehicle_plate, '') AS vehicle_plate,
                    s.quantity, s.unit_price, s.total,
+                   COALESCE(s.vat_amount, 0) AS vat_amount,
+                   COALESCE(s.total_with_vat, s.total) AS total_with_vat,
                    COALESCE(s.note, '') AS note
             FROM sales s
             JOIN products pr ON pr.id = s.product_id
@@ -215,6 +227,59 @@ def sales_report(date_from: str, date_to: str, category: str = None,
             ORDER BY s.sale_date DESC, s.id DESC
         """
         rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def vat_summary(date_from: str, date_to: str, customer: str = None):
+    """VAT for the period:
+      output_vat  = VAT charged on sales (collected from buyers)
+      input_vat   = VAT paid on raw-material purchases
+      vat_payable = output_vat - input_vat  (negative = credit carried forward)
+    """
+    conn = get_connection()
+    try:
+        s_where, s_params = "sale_date BETWEEN ? AND ?", [date_from, date_to]
+        if customer:
+            s_where += " AND LOWER(COALESCE(customer_name,'')) = LOWER(?)"
+            s_params.append(customer)
+        srow = conn.execute(
+            f"""SELECT COALESCE(SUM(total),0) AS net,
+                       COALESCE(SUM(vat_amount),0) AS vat,
+                       COALESCE(SUM(COALESCE(total_with_vat,total)),0) AS gross
+                  FROM sales WHERE {s_where}""", s_params).fetchone()
+        prow = conn.execute(
+            """SELECT COALESCE(SUM(subtotal),0) AS net,
+                      COALESCE(SUM(vat_amount),0) AS vat,
+                      COALESCE(SUM(total_cost),0) AS gross
+                 FROM stock_movements
+                WHERE movement = 'purchase' AND created_at BETWEEN ? AND ?""",
+            (f"{date_from} 00:00:00", f"{date_to} 23:59:59")).fetchone()
+        return {
+            "sales_net": srow["net"], "output_vat": srow["vat"], "sales_gross": srow["gross"],
+            "purchases_net": prow["net"], "input_vat": prow["vat"],
+            "purchases_gross": prow["gross"],
+            "vat_payable": round(srow["vat"] - prow["vat"], 2),
+        }
+    finally:
+        conn.close()
+
+
+def purchases_report(date_from: str, date_to: str):
+    """Per-purchase rows (raw-material stock additions) with cost + VAT."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT substr(sm.created_at, 1, 10) AS purchase_date,
+                      m.code, m.name, m.unit, sm.qty, sm.unit_cost, sm.subtotal,
+                      COALESCE(sm.vat_amount, 0) AS vat_amount, sm.total_cost,
+                      COALESCE(sm.note, '') AS note
+                 FROM stock_movements sm
+                 JOIN materials m ON m.id = sm.material_id
+                WHERE sm.movement = 'purchase' AND sm.created_at BETWEEN ? AND ?
+                ORDER BY sm.created_at DESC, sm.id DESC""",
+            (f"{date_from} 00:00:00", f"{date_to} 23:59:59")).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -342,7 +407,7 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
     customer:    if set, restricts the sales section to this customer.
     Saves a PDF and returns the file path.
     """
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
@@ -354,7 +419,7 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
     bold_font = font[1] if font else "Helvetica-Bold"
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    doc = SimpleDocTemplate(out_path, pagesize=A4,
+    doc = SimpleDocTemplate(out_path, pagesize=landscape(A4),
                             leftMargin=15*mm, rightMargin=15*mm,
                             topMargin=15*mm, bottomMargin=15*mm)
     styles = getSampleStyleSheet()
@@ -455,20 +520,38 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
                 r["sale_date"], r["code"],
                 _amharic_safe(r["name"], r["code"]),
                 r["customer_name"] or "",
+                r.get("tin_number") or "",
+                r.get("vehicle_plate") or "",
                 f"{r['quantity']:.2f}",
                 "pieces" if r["input_unit"]=="piece" else "m²",
                 f"{r['unit_price']:,.2f}",
                 f"{r['total']:,.2f}",
+                f"{r['vat_amount']:,.2f}",
+                f"{r['total_with_vat']:,.2f}",
                 _amharic_safe(r["note"] or "", "") if r["note"] else "",
             ] for r in rows]
             total_qty = sum(r["quantity"] for r in rows)
             total_rev = sum(r["total"] for r in rows)
+            total_vat = sum(r["vat_amount"] for r in rows)
+            total_gross = sum(r["total_with_vat"] for r in rows)
             unit_label = "pieces" if cat != "TERAZO" else "m²"
-            totals = (["TOTAL","","","", f"{total_qty:.2f}", unit_label, "",
-                       f"{total_rev:,.2f}", ""] if rows else None)
+            totals = (["TOTAL","","","","","", f"{total_qty:.2f}", unit_label, "",
+                       f"{total_rev:,.2f}", f"{total_vat:,.2f}", f"{total_gross:,.2f}", ""]
+                      if rows else None)
             add_table(f"{label}",
-                      ["Date","Code","Product","Customer","Qty","Unit","Unit Price","Total (ETB)","Note"],
+                      ["Date","Code","Product","Customer","TIN","Vehicle","Qty","Unit",
+                       "Unit Price","Subtotal","VAT 15%","Total incl. VAT","Note"],
                       data, totals=totals)
+
+        vs = vat_summary(date_from, date_to, customer=customer)
+        add_table("VAT Summary (15%)",
+                  ["", "Net (ETB)", "VAT (ETB)", "Gross (ETB)"],
+                  [["Sales (output VAT)", f"{vs['sales_net']:,.2f}",
+                    f"{vs['output_vat']:,.2f}", f"{vs['sales_gross']:,.2f}"],
+                   ["Purchases (input VAT)", f"{vs['purchases_net']:,.2f}",
+                    f"{vs['input_vat']:,.2f}", f"{vs['purchases_gross']:,.2f}"]],
+                  totals=["VAT PAYABLE (output - input)", "",
+                          f"{vs['vat_payable']:,.2f}", ""])
 
     # ---------- Finished Goods --------------------------------------------
     if report_type in ("finished", "combined"):
@@ -488,4 +571,302 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
                       ["Code","Product","Produced","Sold","In Stock","Unit"], data)
 
     doc.build(story)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Excel export — advanced multi-sheet workbook (uses openpyxl)
+# ---------------------------------------------------------------------------
+
+_CATS = (("HCB", "HCB"), ("TERAZO", "Terazo"), ("PIPE", "Pipes (ቱቦ)"))
+
+
+def export_excel(date_from: str, date_to: str, out_path: str, customer: str = None):
+    """Advanced Excel report.
+
+    Produces a formatted .xlsx workbook with these sheets:
+      - Summary        : report metadata, KPI cards, and per-category charts
+      - Production     : every production run row (all categories, with Category col)
+      - Material Usage : opening / used / purchased / remaining per material
+      - Sales          : per-sale detail incl. Customer / TIN / Vehicle plate
+      - Finished Goods : produced / sold / current stock per product
+
+    Unlike the PDF, this is a data-first export: fully sortable/filterable columns,
+    grand totals, frozen headers, and native Excel charts.
+    Returns the saved file path.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        from openpyxl.chart import BarChart, Reference
+    except ImportError as e:
+        raise RuntimeError(
+            "Excel export requires the 'openpyxl' package.\n"
+            "Install it with:  pip install openpyxl"
+        ) from e
+
+    # ---- shared styles ----
+    HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
+    HEADER_FONT = Font(bold=True, color="FFFFFF")
+    TITLE_FONT = Font(bold=True, size=16, color="1F4E79")
+    SUB_FONT = Font(italic=True, color="6B7B8C")
+    TOTAL_FONT = Font(bold=True)
+    TOTAL_FILL = PatternFill("solid", fgColor="E8EEF7")
+    KPI_LABEL_FONT = Font(bold=True, color="1F4E79")
+    ALERT_FILL = PatternFill("solid", fgColor="F9D6D5")
+    CENTER = Alignment(horizontal="center", vertical="center")
+    thin = Side(style="thin", color="CCCCCC")
+    BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    MONEY = "#,##0.00"
+    QTY = "#,##0.00"
+    MAT = "#,##0.000"
+
+    def style_header(ws, row_idx, ncols):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=row_idx, column=c)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.alignment = CENTER
+            cell.border = BORDER
+        ws.freeze_panes = ws.cell(row=row_idx + 1, column=1)
+
+    def autosize(ws, max_width=48):
+        widths = {}
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is None:
+                    continue
+                col = cell.column_letter
+                widths[col] = max(widths.get(col, 0), len(str(cell.value)))
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = min(max(w + 2, 10), max_width)
+
+    def write_table(ws, start_row, headers, data_rows, col_formats=None,
+                    totals=None):
+        """Write a styled table starting at start_row. Returns the row after the table."""
+        ncols = len(headers)
+        for c, h in enumerate(headers, start=1):
+            ws.cell(row=start_row, column=c, value=h)
+        style_header(ws, start_row, ncols)
+        r = start_row + 1
+        for drow in data_rows:
+            for c, val in enumerate(drow, start=1):
+                cell = ws.cell(row=r, column=c, value=val)
+                cell.border = BORDER
+                if col_formats and col_formats.get(c - 1):
+                    cell.number_format = col_formats[c - 1]
+            r += 1
+        if totals:
+            for c, val in enumerate(totals, start=1):
+                cell = ws.cell(row=r, column=c, value=val)
+                cell.font = TOTAL_FONT
+                cell.fill = TOTAL_FILL
+                cell.border = BORDER
+                if col_formats and col_formats.get(c - 1) and isinstance(val, (int, float)):
+                    cell.number_format = col_formats[c - 1]
+            r += 1
+        # autofilter over the header + data (not totals)
+        last_data_row = start_row + len(data_rows)
+        ws.auto_filter.ref = f"A{start_row}:{get_column_letter(ncols)}{last_data_row}"
+        return r
+
+    def unit_for(cat):
+        return "m²" if cat == "TERAZO" else "pieces"
+
+    wb = openpyxl.Workbook()
+
+    # =====================================================================
+    # Gather data once
+    # =====================================================================
+    prod_by_cat = {cat: production_report(date_from, date_to, category=cat)
+                   for cat, _ in _CATS}
+    sales_by_cat = {cat: sales_report(date_from, date_to, category=cat, customer=customer)
+                    for cat, _ in _CATS}
+    mat_rows = material_usage_report(date_from, date_to)
+    fin_rows = finished_goods_report(date_from, date_to)
+    vs = vat_summary(date_from, date_to, customer=customer)
+    purchase_rows = purchases_report(date_from, date_to)
+
+    # =====================================================================
+    # SUMMARY sheet
+    # =====================================================================
+    ws = wb.active
+    ws.title = "Summary"
+    ws["A1"] = "MN Construction — Factory Report"
+    ws["A1"].font = TITLE_FONT
+    ws["A2"] = (f"Period: {date_from} to {date_to}"
+                + (f"   |   Customer: {customer}" if customer else "")
+                + f"   |   Generated: {datetime.now():%Y-%m-%d %H:%M}")
+    ws["A2"].font = SUB_FONT
+
+    # Per-category KPI table (also used as chart source)
+    kpi_headers = ["Category", "Production Qty", "Sales Qty", "Revenue (ETB)"]
+    kpi_data = []
+    grand_prod = grand_sales_qty = grand_rev = 0.0
+    for cat, label in _CATS:
+        p_qty = sum(r["total_qty"] for r in prod_by_cat[cat])
+        s_qty = sum(r["quantity"] for r in sales_by_cat[cat])
+        rev = sum(r["total"] for r in sales_by_cat[cat])
+        grand_prod += p_qty; grand_sales_qty += s_qty; grand_rev += rev
+        kpi_data.append([label, p_qty, s_qty, rev])
+    kpi_totals = ["TOTAL", grand_prod, grand_sales_qty, grand_rev]
+
+    kpi_start = 4
+    next_row = write_table(
+        ws, kpi_start, kpi_headers, kpi_data,
+        col_formats={1: QTY, 2: QTY, 3: MONEY},
+        totals=kpi_totals,
+    )
+
+    # Headline KPI callouts below the table
+    hl_row = next_row + 1
+    headlines = [
+        ("Total Revenue (ETB)", grand_rev, MONEY),
+        ("Total Units Sold", grand_sales_qty, QTY),
+        ("Total Units Produced", grand_prod, QTY),
+        ("Low-Stock Materials", sum(1 for m in mat_rows if m["remaining"] <= 0), "0"),
+        ("Output VAT on Sales (ETB)", vs["output_vat"], MONEY),
+        ("Input VAT on Purchases (ETB)", vs["input_vat"], MONEY),
+        ("VAT Payable (ETB)", vs["vat_payable"], MONEY),
+    ]
+    for i, (lbl, val, fmt) in enumerate(headlines):
+        lc = ws.cell(row=hl_row + i, column=1, value=lbl)
+        lc.font = KPI_LABEL_FONT
+        vc = ws.cell(row=hl_row + i, column=2, value=val)
+        vc.number_format = fmt
+        vc.font = TOTAL_FONT
+
+    # Charts sourced from the KPI table (header at kpi_start, data below it)
+    data_first = kpi_start + 1
+    data_last = kpi_start + len(kpi_data)
+    cats_ref = Reference(ws, min_col=1, min_row=data_first, max_row=data_last)
+
+    rev_chart = BarChart()
+    rev_chart.title = "Revenue by Category"
+    rev_chart.type = "col"
+    rev_chart.y_axis.title = "ETB"
+    rev_data = Reference(ws, min_col=4, min_row=kpi_start, max_row=data_last)
+    rev_chart.add_data(rev_data, titles_from_data=True)
+    rev_chart.set_categories(cats_ref)
+    rev_chart.height = 7.5; rev_chart.width = 13
+    ws.add_chart(rev_chart, "F4")
+
+    qty_chart = BarChart()
+    qty_chart.title = "Production vs Sales (Qty)"
+    qty_chart.type = "col"
+    qty_data = Reference(ws, min_col=2, max_col=3, min_row=kpi_start, max_row=data_last)
+    qty_chart.add_data(qty_data, titles_from_data=True)
+    qty_chart.set_categories(cats_ref)
+    qty_chart.height = 7.5; qty_chart.width = 13
+    ws.add_chart(qty_chart, "F20")
+
+    autosize(ws)
+
+    # =====================================================================
+    # PRODUCTION sheet (all categories, with Category column)
+    # =====================================================================
+    ws = wb.create_sheet("Production")
+    headers = ["Date", "Category", "Code", "Product", "Quantity", "Unit",
+               "Made By", "Runs", "Notes"]
+    data = []
+    tot_qty = tot_runs = 0
+    for cat, label in _CATS:
+        for r in prod_by_cat[cat]:
+            data.append([
+                r["production_date"], label, r["code"], r["name"],
+                r["total_qty"], unit_for(cat),
+                r.get("made_by") or "", r["runs"], r.get("notes") or "",
+            ])
+            tot_qty += r["total_qty"]; tot_runs += r["runs"]
+    write_table(
+        ws, 1, headers, data,
+        col_formats={4: QTY},
+        totals=["TOTAL", "", "", "", tot_qty, "", "", tot_runs, ""] if data else None,
+    )
+    autosize(ws)
+
+    # =====================================================================
+    # MATERIAL USAGE sheet
+    # =====================================================================
+    ws = wb.create_sheet("Material Usage")
+    headers = ["Code", "Material", "Opening Stock", "Total Used", "Purchased",
+               "Remaining", "Unit"]
+    data = [[m["code"], m["name"], m["opening_stock"], m["total_used"],
+             m["purchased"], m["remaining"], m["unit"]] for m in mat_rows]
+    last = write_table(ws, 1, headers, data, col_formats={2: MAT, 3: MAT, 4: MAT, 5: MAT})
+    # Highlight rows where remaining stock is depleted
+    for i, m in enumerate(mat_rows):
+        if m["remaining"] <= 0:
+            for c in range(1, len(headers) + 1):
+                ws.cell(row=2 + i, column=c).fill = ALERT_FILL
+    autosize(ws)
+
+    # =====================================================================
+    # SALES sheet (per-sale detail incl. TIN + Vehicle plate)
+    # =====================================================================
+    ws = wb.create_sheet("Sales")
+    headers = ["Date", "Category", "Code", "Product", "Customer", "TIN",
+               "Vehicle Plate", "Quantity", "Unit", "Unit Price", "Subtotal (ETB)",
+               "VAT 15% (ETB)", "Total incl. VAT (ETB)", "Note"]
+    data = []
+    tot_qty = tot_rev = tot_vat = tot_gross = 0.0
+    for cat, label in _CATS:
+        for r in sales_by_cat[cat]:
+            data.append([
+                r["sale_date"], label, r["code"], r["name"],
+                r.get("customer_name") or "", r.get("tin_number") or "",
+                r.get("vehicle_plate") or "",
+                r["quantity"], unit_for(cat), r["unit_price"], r["total"],
+                r["vat_amount"], r["total_with_vat"],
+                r.get("note") or "",
+            ])
+            tot_qty += r["quantity"]; tot_rev += r["total"]
+            tot_vat += r["vat_amount"]; tot_gross += r["total_with_vat"]
+    write_table(
+        ws, 1, headers, data,
+        col_formats={7: QTY, 9: MONEY, 10: MONEY, 11: MONEY, 12: MONEY},
+        totals=(["TOTAL", "", "", "", "", "", "", tot_qty, "", "", tot_rev,
+                 tot_vat, tot_gross, ""] if data else None),
+    )
+    autosize(ws)
+
+    # =====================================================================
+    # PURCHASES sheet (raw-material purchases with input VAT)
+    # =====================================================================
+    ws = wb.create_sheet("Purchases")
+    headers = ["Date", "Code", "Material", "Quantity", "Unit", "Unit Cost",
+               "Subtotal (ETB)", "VAT 15% (ETB)", "Total Paid (ETB)", "Note"]
+    data = [[r["purchase_date"], r["code"], r["name"], r["qty"], r["unit"],
+             r["unit_cost"], r["subtotal"], r["vat_amount"], r["total_cost"],
+             r["note"]] for r in purchase_rows]
+    write_table(
+        ws, 1, headers, data,
+        col_formats={3: MAT, 5: MONEY, 6: MONEY, 7: MONEY, 8: MONEY},
+        totals=(["TOTAL", "", "", "", "", "",
+                 sum(r["subtotal"] or 0 for r in purchase_rows),
+                 sum(r["vat_amount"] or 0 for r in purchase_rows),
+                 sum(r["total_cost"] or 0 for r in purchase_rows), ""]
+                if data else None),
+    )
+    autosize(ws)
+
+    # =====================================================================
+    # FINISHED GOODS sheet
+    # =====================================================================
+    ws = wb.create_sheet("Finished Goods")
+    headers = ["Category", "Code", "Product", "Produced", "Sold", "In Stock", "Unit"]
+    data = []
+    for cat, label in _CATS:
+        for r in [x for x in fin_rows if x["category"] == cat]:
+            data.append([
+                label, r["code"], r["name"], r["produced"], r["sold"],
+                r["current_stock"], unit_for(cat),
+            ])
+    write_table(ws, 1, headers, data, col_formats={3: QTY, 4: QTY, 5: QTY})
+    autosize(ws)
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
     return out_path

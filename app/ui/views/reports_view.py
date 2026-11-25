@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
                              QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
                              QDateEdit, QFileDialog, QMessageBox, QTabWidget)
 
+from app.database.db import EXPORTS_DIR
 from app.services import report_service
 from app.ui.widgets.search_box import SearchBox
 
@@ -80,6 +81,8 @@ class ReportsView(QWidget):
         f.addWidget(run)
         exp = QPushButton("📄 Export PDF"); exp.setObjectName("success"); exp.clicked.connect(self._export_pdf)
         f.addWidget(exp)
+        expx = QPushButton("📊 Export Excel"); expx.setObjectName("success"); expx.clicked.connect(self._export_excel)
+        f.addWidget(expx)
         outer.addLayout(f)
 
         # Search row
@@ -122,7 +125,7 @@ class ReportsView(QWidget):
             lbl = QLabel(label); lbl.setStyleSheet("font-weight: bold; color: #1F4E79; font-size: 13px;")
             sv.addWidget(lbl)
             t = self._make_table(
-                ["Date","Code","Product","Customer","Quantity","Unit","Unit Price","Total (ETB)","Notes"])
+                ["Date","Code","Product","Customer","TIN","Vehicle","Quantity","Unit","Unit Price","Subtotal","VAT 15%","Total incl. VAT","Notes"])
             self.tbl_sales[code] = t
             self.search.attach(t)
             sv.addWidget(t)
@@ -291,8 +294,11 @@ class ReportsView(QWidget):
             cells = [
                 row["sale_date"], row["code"], row["name"],
                 row.get("customer_name") or "",
+                row.get("tin_number") or "",
+                row.get("vehicle_plate") or "",
                 f"{row['quantity']:.2f}", unit,
                 f"{row['unit_price']:,.2f}", f"{row['total']:,.2f}",
+                f"{row['vat_amount']:,.2f}", f"{row['total_with_vat']:,.2f}",
                 row.get("note") or "",
             ]
             for c, val in enumerate(cells):
@@ -330,14 +336,30 @@ class ReportsView(QWidget):
         df, dt = self._date_range()
         customer = self._selected_customer()
         suffix = f"_for_{customer.replace(' ','_')}" if customer else ""
-        default = Path.cwd() / "exports" / f"MN_Construction_report_{df}_to_{dt}{suffix}.pdf"
-        default.parent.mkdir(exist_ok=True)
+        default = EXPORTS_DIR / f"MN_Construction_report_{df}_to_{dt}{suffix}.pdf"
+        default.parent.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
             self, "Save PDF", str(default), "PDF Files (*.pdf)")
         if not path:
             return
         try:
             report_service.export_pdf("combined", df, dt, path, customer=customer)
+            QMessageBox.information(self, "Exported", f"Saved to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _export_excel(self):
+        df, dt = self._date_range()
+        customer = self._selected_customer()
+        suffix = f"_for_{customer.replace(' ','_')}" if customer else ""
+        default = EXPORTS_DIR / f"MN_Construction_report_{df}_to_{dt}{suffix}.xlsx"
+        default.parent.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Excel", str(default), "Excel Files (*.xlsx)")
+        if not path:
+            return
+        try:
+            report_service.export_excel(df, dt, path, customer=customer)
             QMessageBox.information(self, "Exported", f"Saved to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
